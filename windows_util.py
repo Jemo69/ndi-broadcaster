@@ -9,9 +9,11 @@ Monitors are enumerated via `mss` (always available once installed).
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 
 XWININFO_RE = re.compile(
     r'(0x[0-9a-fA-F]+)\s+"([^"]*)".*?(\d+)x(\d+)\+(-?\d+)\+(-?\d+)'
@@ -103,10 +105,99 @@ def list_windows_xdotool() -> list[dict]:
 
 
 def list_windows() -> list[dict]:
+    if sys.platform == "win32":
+        return list_windows_windows()
     wins = list_windows_xwininfo()
     if wins:
         return wins
     return list_windows_xdotool()
+
+
+def list_windows_windows() -> list[dict]:
+    """Enumerate top-level windows on Windows via ctypes (no extra deps).
+
+    Returns the same dicts as the X11 backends (id/title/app/x/y/w/h) so the
+    rest of the app works unchanged. Coordinates are screen pixels for mss.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    own_pid = os.getpid()
+    found: list[dict] = []
+
+    def exe_of(pid: int) -> str:
+        try:
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return "unknown"
+            try:
+                buf = ctypes.create_unicode_buffer(260)
+                size = wintypes.DWORD(260)
+                if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    return (buf.value.rsplit("\\", 1)[-1] or "unknown").lower()
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return "unknown"
+
+    def cb(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value.strip()
+            if not title:
+                return True
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if w < MIN_W or h < MIN_H:
+                return True
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == own_pid:
+                return True  # hide our own broadcaster window
+            found.append({
+                "id": str(hwnd),
+                "title": title,
+                "app": exe_of(pid.value),
+                "x": rect.left, "y": rect.top, "w": w, "h": h,
+            })
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(EnumWindowsProc(cb), 0)
+    except Exception:
+        return []
+    found.sort(key=lambda d: d["w"] * d["h"], reverse=True)
+    return found
 
 
 def list_monitors() -> list[dict]:

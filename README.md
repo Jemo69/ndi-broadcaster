@@ -47,6 +47,31 @@ sh run.sh
 - Capture runs in a background thread; Tk pulls the latest preview frame via a
   size-1 queue, so the UI never blocks.
 
+## Network visibility — same subnet vs full network
+
+- **Default (empty Discovery Server):** the stream advertises via mDNS, so it is
+  found automatically by receivers **on the same subnet**. The sending PC and the
+  viewing PC must be on the same LAN/subnet.
+- **Full network (other subnets/VLANs):** run
+  [NDI Discovery Server](https://docs.ndi.video/all/using-ndi/utilities/discovery-service)
+  (free, in NDI Tools) on a machine reachable from all subnets, then:
+  - on **Linux** enter its IP in the app's **Discovery Server** field (the app
+    writes `~/.ndi/ndi-config.v1.json` for you before going live);
+  - on **Windows/macOS** enter it in **NDI Access Manager → Advanced** on this PC.
+  - ⚠️ Trade-off (NDI design): with a server set, mDNS is **off** — receivers must
+    point at the **same** server or they won't see the stream.
+- **Windows Firewall:** on first launch allow `NDI-Broadcaster` on **Private**
+  networks, otherwise other PCs can't see or pull the stream.
+- Changing Discovery Server applies on the next GO LIVE (sender re-registers).
+
+## Windows notes
+
+- The window list, monitor capture and region picker all work on Windows
+  (enumeration via Win32 `EnumWindows`, no extra install). Keep the source window
+  visible — capture is region-based, overlaps get captured too.
+- If a window is missing from the list, it is likely a minimized or
+  title-less helper window; restore it and press ⟳.
+
 ## Notes / limitations
 
 - **Wayland:** due to Wayland isolation, only **XWayland** windows are listable
@@ -67,5 +92,6 @@ sh run.sh
 | `app.py` | Tk UI (dark theme, preview, region picker) |
 | `capture.py` | background capture thread + test pattern |
 | `ndi_sender.py` | `cyndilib` wrapper with preview-only fallback |
+| `ndi_config.py` | Discovery Server config (`~/.ndi/ndi-config.v1.json`) |
 | `windows_util.py` | window/monitor enumeration |
 | `requirements.txt` | `cyndilib`, `mss`, `Pillow`, `numpy` |

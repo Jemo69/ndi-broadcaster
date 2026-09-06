@@ -9,9 +9,11 @@ Run:
 from __future__ import annotations
 
 import queue
+import sys
 import tkinter as tk
 from tkinter import ttk
 
+import ndi_config
 from capture import CaptureEngine
 from ndi_sender import NdiSender, HAVE_NDI, CYNDILIB_VERSION
 from windows_util import list_monitors, list_windows
@@ -113,6 +115,13 @@ class RegionPicker(tk.Toplevel):
 
 class NdiBroadcasterApp(tk.Tk):
     def __init__(self):
+        if sys.platform == "win32":
+            # System-DPI awareness so GetWindowRect coords match mss pixels.
+            try:
+                import ctypes
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
         super().__init__()
         self.title("NDI Broadcaster")
         self.geometry("1180x720")
@@ -243,8 +252,9 @@ class NdiBroadcasterApp(tk.Tk):
         self.preview_label.pack(fill="both", expand=True, pady=(10, 4))
         self.hint_label = ttk.Label(
             center, style="CardMuted.TLabel",
-            text="Tip: on Wayland only XWayland windows are listable. "
-                 "Use “Pick region” or a full monitor otherwise.")
+            text="Wayland: only XWayland windows list — else Pick region / monitor. • "
+                 "Stream not found elsewhere? Same subnet + firewall allow; cross-subnet "
+                 "needs a Discovery Server.")
         self.hint_label.pack(anchor="w")
 
         # ---- right: output ----
@@ -276,6 +286,21 @@ class NdiBroadcasterApp(tk.Tk):
         self.preview_while_live = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Show preview while live",
                         variable=self.preview_while_live).pack(anchor="w", pady=(10, 0))
+
+        ttk.Label(right, text="Discovery Server (cross-subnet, optional)",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(10, 2))
+        self.discovery_var = tk.StringVar(value=ndi_config.get_discovery_server())
+        self.discovery_entry = ttk.Entry(right, textvariable=self.discovery_var)
+        self.discovery_entry.pack(fill="x")
+        if ndi_config.supported():
+            ttk.Label(right, style="CardMuted.TLabel", wraplength=250, justify="left",
+                      text="Empty = same-subnet mDNS (default). Set a server IP to be "
+                           "visible network-wide — receivers must use the same server.").pack(anchor="w")
+        else:
+            self.discovery_entry.configure(state="disabled")
+            ttk.Label(right, style="CardMuted.TLabel", wraplength=250, justify="left",
+                      text="For cross-subnet visibility set the server in "
+                           "NDI Access Manager → Advanced on this PC.").pack(anchor="w")
 
         self.go_btn = ttk.Button(right, text="●  GO LIVE", style="Accent.TButton",
                                  command=self.toggle_live)
@@ -389,11 +414,23 @@ class NdiBroadcasterApp(tk.Tk):
             pass
         return fps, self.scale_var.get(), self.ndi_name.get().strip() or "TK Broadcaster"
 
+    def _apply_discovery_config(self):
+        """Write the discovery-server choice before the NDI sender opens."""
+        if not ndi_config.supported():
+            return
+        want = self.discovery_var.get().strip()
+        try:
+            if want != ndi_config.get_discovery_server():
+                ndi_config.set_discovery_server(want)
+        except Exception as e:
+            self.footer.configure(text=f"Discovery Server not saved: {e}")
+
     def _start_engine(self):
         if not self.selected:
             self.footer.configure(text="Pick a source first.")
             return
         self._stop_engine()
+        self._apply_discovery_config()
         fps, scale, name = self._engine_params()
         self.preview_q = queue.Queue(maxsize=2)
         self.engine = CaptureEngine(self.selected, fps, scale, name,
