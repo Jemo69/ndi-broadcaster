@@ -37,6 +37,7 @@ class NdiSender:
         self._fps = 30
         self._opened = False
         self.frames_sent = 0
+        self._last_send_error = ""
 
     @property
     def import_error(self) -> str:
@@ -45,6 +46,11 @@ class NdiSender:
     @property
     def is_open(self) -> bool:
         return self._opened
+
+    @property
+    def last_send_error(self) -> str:
+        """Last send failure ('' when sends succeed). Shown in diagnostics."""
+        return self._last_send_error
 
     @property
     def resolution(self) -> tuple[int, int]:
@@ -93,7 +99,24 @@ class NdiSender:
         if not self.available or self._sender is None:
             return  # preview-only: just count
         try:
-            mv = bgra if isinstance(bgra, memoryview) else memoryview(bgra)
+            # cyndilib needs a WRITABLE, 1-D buffer (bytes/memoryview-of-bytes
+            # raises BufferError) — normalize without copying when possible.
+            if isinstance(bgra, memoryview):
+                buf = bgra if not bgra.readonly else bytearray(bgra)
+            elif isinstance(bgra, bytearray):
+                buf = bgra
+            else:
+                try:
+                    import numpy as _np
+                    buf = bgra if isinstance(bgra, _np.ndarray) else bytearray(bgra)
+                except ImportError:
+                    buf = bytearray(bgra)
+            if hasattr(buf, "ndim") and buf.ndim != 1:
+                try:
+                    buf = buf.reshape(-1)  # writable 1-D view, no copy if contiguous
+                except Exception:
+                    buf = bytearray(bytes(buf))
+            mv = buf if isinstance(buf, memoryview) else memoryview(buf)
             try:
                 self._sender.write_video_async(mv)
             except AttributeError:
@@ -104,8 +127,8 @@ class NdiSender:
                     self._sender.send_video_async()
                 except AttributeError:
                     self._sender.send_video()
-        except Exception:
-            pass  # never let NDI errors kill the capture loop
+        except Exception as e:
+            self._last_send_error = str(e)  # visible in diagnostics, not fatal
 
     def connections(self) -> int:
         if not self.available or self._sender is None or not self._opened:

@@ -224,7 +224,8 @@ class CaptureEngine(threading.Thread):
                         bgra[:, :, 1] = arr[:, :, 1]
                         bgra[:, :, 2] = arr[:, :, 0]
                         bgra[:, :, 3] = 255
-                        self.sender.send(bgra.tobytes())
+                        # pass the writable array itself (zero-copy)
+                        self.sender.send(bgra)
                     else:
                         rgba = img.convert("RGBA")
                         r, g, b, a = rgba.split()

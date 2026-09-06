@@ -12,13 +12,20 @@ import socket
 
 def backend_report() -> dict:
     from ndi_sender import HAVE_NDI, CYNDILIB_VERSION
-    info: dict = {"have_ndi": HAVE_NDI, "cyndilib": CYNDILIB_VERSION, "runtime": ""}
+    info: dict = {"have_ndi": HAVE_NDI, "cyndilib": CYNDILIB_VERSION,
+                  "runtime": "", "import_error": ""}
     if HAVE_NDI:
         try:
             from cyndilib import ndi_version
             info["runtime"] = str(ndi_version)
         except Exception as e:
             info["runtime"] = f"unreadable ({e})"
+    else:
+        try:
+            from ndi_sender import _IMPORT_ERROR
+            info["import_error"] = str(_IMPORT_ERROR)[:500]
+        except Exception:
+            pass
     return info
 
 

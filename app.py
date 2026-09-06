@@ -573,12 +573,17 @@ class DiagnosticsDialog(tk.Toplevel):
         b = diag.backend_report()
         lines = [
             f"Backend: {'cyndilib ' + b['cyndilib'] if b['have_ndi'] else 'PREVIEW-ONLY (no NDI lib!)'}",
+        ]
+        if b.get("import_error"):
+            lines.append(f"Import error: {b['import_error']}")
+        lines += [
             f"NDI runtime: {b['runtime'] or '—'}",
             f"Sender: {'OPEN' if self.app.sender.is_open else 'closed'}"
             + (f"  name={self.app._engine_params()[2]}"
                f"  {self.app.sender.resolution[0]}x{self.app.sender.resolution[1]}"
                if self.app.sender.is_open else ""),
             f"Frames sent: {self.app.sender.frames_sent}",
+            f"Send errors: {self.app.sender.last_send_error or 'none'}",
             f"Local IPs: {', '.join(diag.local_ips())}",
             "",
         ]

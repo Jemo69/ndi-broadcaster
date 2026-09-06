@@ -93,5 +93,7 @@ sh run.sh
 | `capture.py` | background capture thread + test pattern |
 | `ndi_sender.py` | `cyndilib` wrapper with preview-only fallback |
 | `ndi_config.py` | Discovery Server config (`~/.ndi/ndi-config.v1.json`) |
+| `diag.py` | Self-diagnostics (backend, IPs, network scan) |
+| `pyi_rth_ndi.py` | PyInstaller runtime hook (finds NDI DLL when frozen) |
 | `windows_util.py` | window/monitor enumeration |
 | `requirements.txt` | `cyndilib`, `mss`, `Pillow`, `numpy` |
