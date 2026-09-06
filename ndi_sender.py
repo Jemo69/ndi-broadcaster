@@ -138,6 +138,10 @@ class NdiSender:
         except Exception:
             return 0
 
+    def reset_stats(self) -> None:
+        self.frames_sent = 0
+        self._last_send_error = ""
+
     def close(self) -> None:
         if self._sender is not None:
             for meth in ("close", "__exit__"):

@@ -471,7 +471,23 @@ class NdiBroadcasterApp(tk.Tk):
             self.footer.configure(text="Previewing… (not broadcasting)")
         else:
             self._stop_engine()
+            self._reset_idle_ui()
             self.footer.configure(text="Preview stopped.")
+
+    def _reset_idle_ui(self):
+        """Return visuals to the just-opened state (keeps source selection)."""
+        self.status.update({"running": False, "frames": 0, "actual_fps": 0.0,
+                            "out_w": 0, "out_h": 0, "last_error": ""})
+        try:
+            self.sender.reset_stats()
+        except Exception:
+            pass
+        self.stat_label.configure(text="—")
+        self.conn_label.configure(text="Viewers: —")
+        self.err_label.configure(text="")
+        self._photo = None
+        self.preview_label.configure(
+            image="", text="Select a source, then press  ▶ Preview  or  GO LIVE")
 
     def toggle_live(self):
         if not self.live:
@@ -488,9 +504,10 @@ class NdiBroadcasterApp(tk.Tk):
         else:
             self.live = False
             self._stop_engine()
+            self._reset_idle_ui()
             self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
             self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
-            self.footer.configure(text="Broadcast stopped.")
+            self.footer.configure(text="Stopped — pick a source and GO LIVE when ready.")
 
     # -- ticks -----------------------------------------------------------
     def _preview_tick(self):
