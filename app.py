@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import queue
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk
 
+import diag
 import ndi_config
 from capture import CaptureEngine
 from ndi_sender import NdiSender, HAVE_NDI, CYNDILIB_VERSION
@@ -308,6 +310,8 @@ class NdiBroadcasterApp(tk.Tk):
 
         self.conn_label = ttk.Label(right, text="Viewers: —", style="CardMuted.TLabel")
         self.conn_label.pack(anchor="w")
+        ttk.Button(right, text="🩺 Diagnose “can't see my stream”…",
+                   command=self._open_diagnostics).pack(fill="x", pady=(6, 0))
         self.err_label = ttk.Label(right, text="", style="CardMuted.TLabel",
                                    wraplength=250, justify="left", foreground=YELLOW)
         self.err_label.pack(anchor="w", pady=(4, 0))
@@ -396,6 +400,9 @@ class NdiBroadcasterApp(tk.Tk):
 
     def _open_region_picker(self):
         RegionPicker(self, self._on_region_pick)
+
+    def _open_diagnostics(self):
+        DiagnosticsDialog(self, self)
 
     def _on_region_pick(self, region: dict):
         self.sources.append(region)
@@ -533,6 +540,95 @@ class NdiBroadcasterApp(tk.Tk):
             self._stop_engine()
         finally:
             self.destroy()
+
+
+class DiagnosticsDialog(tk.Toplevel):
+    """'Why can't I see my stream?' — versions, IPs, live network scan."""
+
+    def __init__(self, master, app: "NdiBroadcasterApp"):
+        super().__init__(master)
+        self.app = app
+        self.title("NDI Diagnostics")
+        self.geometry("560x520")
+        self.configure(bg=BG_CARD)
+        ttk.Label(self, text="NDI DIAGNOSTICS", style="Section.TLabel").pack(  # type: ignore
+            anchor="w", padx=14, pady=(12, 4))
+
+        self.text = tk.Text(self, bg=BG_INPUT, fg=TEXT, font=FONT_MONO,
+                            highlightthickness=1, highlightcolor=BORDER,
+                            padx=10, pady=10, wrap="word", height=22)
+        self.text.pack(fill="both", expand=True, padx=14)
+        self.text.configure(state="disabled")
+
+        row = ttk.Frame(self, style="Card.TFrame")
+        row.pack(fill="x", padx=14, pady=10)
+        self.scan_btn = ttk.Button(row, text="🔍 Scan network for NDI sources",
+                                   command=self._run_scan)
+        self.scan_btn.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="⧉ Copy report",
+                   command=self._copy).pack(side="right", padx=(8, 0))
+        self._write_report(sources=None)
+
+    def _report(self, sources) -> str:
+        b = diag.backend_report()
+        lines = [
+            f"Backend: {'cyndilib ' + b['cyndilib'] if b['have_ndi'] else 'PREVIEW-ONLY (no NDI lib!)'}",
+            f"NDI runtime: {b['runtime'] or '—'}",
+            f"Sender: {'OPEN' if self.app.sender.is_open else 'closed'}"
+            + (f"  name={self.app._engine_params()[2]}"
+               f"  {self.app.sender.resolution[0]}x{self.app.sender.resolution[1]}"
+               if self.app.sender.is_open else ""),
+            f"Frames sent: {self.app.sender.frames_sent}",
+            f"Local IPs: {', '.join(diag.local_ips())}",
+            "",
+        ]
+        if sources is None:
+            lines.append("Network scan: not run yet — press Scan. (Go LIVE first,")
+            lines.append("then check your stream name appears below.)")
+        elif not sources:
+            lines.append("Network scan: NO NDI sources visible at all — even mDNS")
+            lines.append("discovery looks broken on this PC (firewall/VPN/network")
+            lines.append("profile?). Fix that before anything else.")
+        else:
+            lines.append(f"Network scan: {len(sources)} source(s) visible:")
+            lines.extend(f"  • {s}" for s in sources)
+            own = self.app._engine_params()[2]
+            lines.append("")
+            lines.append("YOUR stream " + ("IS visible ✔" if any(own in s for s in sources)
+                                           else "NOT visible ✘ (sender may be closed)"))
+        lines += [
+            "",
+            "If YOUR stream shows above but not on the other PC:",
+            " 1. Same subnet? (compare IPs — first 3 numbers must match)",
+            " 2. Firewall allowed on Private network? (sender AND receiver)",
+            " 3. No VPN active? (VPNs usually block mDNS discovery)",
+            " 4. Receiver up to date? (NDI 6 stream, use current NDI Tools)",
+            " 5. Other subnets? Set the same Discovery Server on both ends.",
+        ]
+        return "\n".join(lines)
+
+    def _write_report(self, sources) -> None:
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", self._report(sources))
+        self.text.configure(state="disabled")
+
+    def _run_scan(self):
+        self.scan_btn.configure(state="disabled", text="Scanning… (~6s)")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        names = diag.scan_sources(6.0)
+        self.after(0, lambda: self._scan_done(names))
+
+    def _scan_done(self, names):
+        self._write_report(names)
+        self.scan_btn.configure(state="normal", text="🔍 Scan network for NDI sources")
+
+    def _copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.text.get("1.0", "end").strip())
+        self.update()
 
 
 def main():
