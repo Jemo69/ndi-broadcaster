@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""NDI Broadcaster — pick a window, broadcast it as NDI.
+
+Run:
+    pip install -r requirements.txt
+    python3 app.py
+"""
+
+from __future__ import annotations
+
+import queue
+import tkinter as tk
+from tkinter import ttk
+
+from capture import CaptureEngine
+from ndi_sender import NdiSender, HAVE_NDI, CYNDILIB_VERSION
+from windows_util import list_monitors, list_windows
+
+try:
+    from PIL import ImageTk
+    HAVE_IMAGETK = True
+except ImportError:
+    HAVE_IMAGETK = False
+
+# -- theme ---------------------------------------------------------------
+BG_ROOT = "#0e1116"
+BG_PANEL = "#141922"
+BG_CARD = "#1b2230"
+BG_INPUT = "#0b0e13"
+BORDER = "#2a3444"
+TEXT = "#e9eef5"
+MUTED = "#8b96a8"
+ACCENT = "#00c8ff"
+ACCENT_DARK = "#0a9cc4"
+GREEN = "#2ecc71"
+RED = "#ff4d5e"
+YELLOW = "#f5b942"
+
+FONT_TITLE = ("Segoe UI", 15, "bold")
+FONT_SECTION = ("Segoe UI", 9, "bold")
+FONT_BODY = ("Segoe UI", 10)
+FONT_SMALL = ("Segoe UI", 9)
+FONT_MONO = ("Consolas", 9)
+
+
+class RegionPicker(tk.Toplevel):
+    """Let the user drag a rectangle over a screenshot to pick a region."""
+
+    def __init__(self, master, on_pick):
+        super().__init__(master)
+        self.on_pick = on_pick
+        self.title("Drag to select a region — Esc to cancel")
+        self.configure(bg="black")
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+        try:
+            import mss
+            from PIL import Image, ImageTk as _ITk
+        except ImportError:
+            tk.messagebox.showerror("Missing dep", "mss + Pillow required.")  # type: ignore
+            self.destroy()
+            return
+
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+            shot = sct.grab(mon)
+            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        sw, sh = shot.width, shot.height
+        fw, fh = self.winfo_screenwidth(), self.winfo_screenheight()
+        sx, sy = fw / max(1, sw), fh / max(1, sh)
+        disp = img.resize((fw, fh))
+        self._photo = _ITk.PhotoImage(disp)
+        self._ox, self._oy = mon["left"], mon["top"]
+        self._sx, self._sy = sw / max(1, fw), sh / max(1, fh)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="black",
+                                cursor="crosshair")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+        self.canvas.create_text(fw // 2, 28, text="DRAG TO SELECT REGION  •  ESC TO CANCEL",
+                                fill="white", font=("Segoe UI", 12, "bold"))
+        self._start = None
+        self._rect = None
+        self.canvas.bind("<ButtonPress-1>", self._down)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._up)
+
+    def _down(self, e):
+        self._start = (e.x, e.y)
+        if self._rect:
+            self.canvas.delete(self._rect)
+        self._rect = self.canvas.create_rectangle(e.x, e.y, e.x, e.y,
+                                                  outline=ACCENT, width=2)
+
+    def _drag(self, e):
+        if self._start and self._rect:
+            self.canvas.coords(self._rect, self._start[0], self._start[1], e.x, e.y)
+
+    def _up(self, e):
+        if not self._start:
+            self.destroy()
+            return
+        x0, y0 = self._start
+        x1, y1 = e.x, e.y
+        x, y = int(min(x0, x1) * self._sx) + self._ox, int(min(y0, y1) * self._sy) + self._oy
+        w, h = int(abs(x1 - x0) * self._sx), int(abs(y1 - y0) * self._sy)
+        self.destroy()
+        if w >= 64 and h >= 64:
+            self.on_pick({"kind": "region", "label": f"Custom region {w}x{h}",
+                           "x": x, "y": y, "w": w, "h": h})
+
+
+class NdiBroadcasterApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("NDI Broadcaster")
+        self.geometry("1180x720")
+        self.minsize(1020, 620)
+        self.configure(bg=BG_ROOT)
+
+        self.sources: list[dict] = []     # display list (windows+monitors+special)
+        self.selected: dict | None = None
+        self.engine: CaptureEngine | None = None
+        self.sender = NdiSender()
+        self.preview_q: queue.Queue = queue.Queue(maxsize=2)
+        self.status: dict = {"running": False, "frames": 0, "actual_fps": 0.0,
+                             "out_w": 0, "out_h": 0, "last_error": ""}
+        self.previewing = False
+        self.live = False
+        self._photo = None
+
+        self._build_style()
+        self._build_layout()
+        self.refresh_sources()
+        self.after(80, self._preview_tick)
+        self.after(500, self._stats_tick)
+
+    # -- styling ---------------------------------------------------------
+    def _build_style(self):
+        s = ttk.Style(self)
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
+        s.configure(".", background=BG_PANEL, foreground=TEXT, font=FONT_BODY,
+                    fieldbackground=BG_INPUT, bordercolor=BORDER)
+        s.configure("TFrame", background=BG_PANEL)
+        s.configure("Card.TFrame", background=BG_CARD)
+        s.configure("TLabel", background=BG_PANEL, foreground=TEXT)
+        s.configure("Card.TLabel", background=BG_CARD, foreground=TEXT)
+        s.configure("Muted.TLabel", background=BG_PANEL, foreground=MUTED, font=FONT_SMALL)
+        s.configure("CardMuted.TLabel", background=BG_CARD, foreground=MUTED, font=FONT_SMALL)
+        s.configure("Section.TLabel", background=BG_PANEL, foreground=MUTED, font=FONT_SECTION)
+        s.configure("TEntry", fieldbackground=BG_INPUT, foreground=TEXT,
+                    bordercolor=BORDER, insertcolor=TEXT)
+        s.configure("TCombobox", fieldbackground=BG_INPUT, foreground=TEXT,
+                    background=BG_CARD, bordercolor=BORDER, arrowcolor=MUTED)
+        s.map("TCombobox", fieldbackground=[("readonly", BG_INPUT)],
+              background=[("readonly", BG_CARD)])
+        s.configure("TButton", background="#232c3b", foreground=TEXT,
+                    bordercolor=BORDER, font=FONT_BODY, padding=(10, 6))
+        s.map("TButton", background=[("active", "#2e3a4f"), ("pressed", "#222b3c")])
+        s.configure("Accent.TButton", background=ACCENT_DARK, foreground="white",
+                    font=("Segoe UI", 11, "bold"), padding=(10, 10))
+        s.map("Accent.TButton", background=[("active", ACCENT)])
+        s.configure("Stop.TButton", background="#a02c38", foreground="white",
+                    font=("Segoe UI", 11, "bold"), padding=(10, 10))
+        s.map("Stop.TButton", background=[("active", RED)])
+        s.configure("TCheckbutton", background=BG_PANEL, foreground=TEXT)
+
+    # -- layout ----------------------------------------------------------
+    def _panel(self, parent, **kw):
+        f = ttk.Frame(parent, style="Card.TFrame", padding=14, **kw)
+        f.configure(borderwidth=1, relief="solid")
+        return f
+
+    def _build_layout(self):
+        # Header
+        header = tk.Frame(self, bg=BG_ROOT, height=56)
+        header.pack(fill="x", padx=16, pady=(12, 8))
+        header.pack_propagate(False)
+        tk.Label(header, text="◉  NDI Broadcaster", bg=BG_ROOT, fg=TEXT,
+                 font=FONT_TITLE).pack(side="left")
+        tk.Label(header, text="window → NDI output", bg=BG_ROOT, fg=MUTED,
+                 font=FONT_SMALL).pack(side="left", padx=(10, 0), pady=(6, 0))
+        self.live_pill = tk.Label(header, text="●  IDLE", bg="#1d2532", fg=MUTED,
+                                  font=("Segoe UI", 10, "bold"), padx=14, pady=6)
+        self.live_pill.pack(side="right")
+        backend = f"cyndilib {CYNDILIB_VERSION}" if HAVE_NDI else "preview-only (no NDI lib)"
+        tk.Label(header, text=backend, bg=BG_ROOT, fg=MUTED,
+                 font=FONT_SMALL).pack(side="right", padx=(0, 12), pady=(6, 0))
+
+        main = tk.Frame(self, bg=BG_ROOT)
+        main.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        main.columnconfigure(0, weight=0, minsize=330)
+        main.columnconfigure(1, weight=1)
+        main.columnconfigure(2, weight=0, minsize=290)
+        main.rowconfigure(0, weight=1)
+
+        # ---- left: sources ----
+        left = self._panel(main)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Label(left, text="SOURCE", style="Section.TLabel").pack(anchor="w")  # type: ignore
+        search_row = ttk.Frame(left, style="Card.TFrame")
+        search_row.pack(fill="x", pady=(6, 6))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._render_list())
+        search = ttk.Entry(search_row, textvariable=self.search_var)
+        search.pack(side="left", fill="x", expand=True)
+        ttk.Button(search_row, text="⟳", width=3,
+                   command=self.refresh_sources).pack(side="right", padx=(6, 0))
+
+        self.src_list = tk.Listbox(left, bg=BG_INPUT, fg=TEXT,
+                                   selectbackground=ACCENT_DARK,
+                                   selectforeground="white", font=FONT_BODY,
+                                   highlightthickness=1, highlightcolor=BORDER,
+                                   activestyle="none", height=18)
+        self.src_list.pack(fill="both", expand=True)
+        self.src_list.bind("<<ListboxSelect>>", self._on_select)
+        self.src_detail = ttk.Label(left, text="No source selected",
+                                    style="CardMuted.TLabel", wraplength=300,
+                                    justify="left")
+        self.src_detail.pack(anchor="w", pady=(8, 0))
+        btn_row = ttk.Frame(left, style="Card.TFrame")
+        btn_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_row, text="▦ Pick region…",
+                   command=self._open_region_picker).pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_row, text="▶ Preview",
+                   command=self.toggle_preview).pack(side="right", padx=(6, 0))
+
+        # ---- center: preview ----
+        center = self._panel(main)
+        center.grid(row=0, column=1, sticky="nsew", padx=8)
+        top = ttk.Frame(center, style="Card.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text="PREVIEW", style="Section.TLabel").pack(side="left")  # type: ignore
+        self.stat_label = ttk.Label(top, text="—", style="CardMuted.TLabel")
+        self.stat_label.pack(side="right")
+        self.preview_label = tk.Label(center, bg="black", fg=MUTED,
+                                      text="Select a source, then press  ▶ Preview  or  GO LIVE",
+                                      font=("Segoe UI", 11), compound="center")
+        self.preview_label.pack(fill="both", expand=True, pady=(10, 4))
+        self.hint_label = ttk.Label(
+            center, style="CardMuted.TLabel",
+            text="Tip: on Wayland only XWayland windows are listable. "
+                 "Use “Pick region” or a full monitor otherwise.")
+        self.hint_label.pack(anchor="w")
+
+        # ---- right: output ----
+        right = self._panel(main)
+        right.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        ttk.Label(right, text="OUTPUT", style="Section.TLabel").pack(anchor="w")  # type: ignore
+
+        ttk.Label(right, text="NDI source name", style="CardMuted.TLabel").pack(
+            anchor="w", pady=(10, 2))
+        self.ndi_name = tk.StringVar(value="TK Broadcaster (Window)")
+        ttk.Entry(right, textvariable=self.ndi_name).pack(fill="x")
+
+        row = ttk.Frame(right, style="Card.TFrame")
+        row.pack(fill="x", pady=(10, 0))
+        lf = ttk.Frame(row, style="Card.TFrame")
+        lf.pack(side="left", fill="x", expand=True)
+        ttk.Label(lf, text="Frame rate", style="CardMuted.TLabel").pack(anchor="w")
+        self.fps_var = tk.StringVar(value="30")
+        ttk.Combobox(lf, textvariable=self.fps_var, values=["15", "24", "25", "30", "50", "60"],
+                     state="readonly", width=8).pack(anchor="w", pady=(2, 0))
+        rf = ttk.Frame(row, style="Card.TFrame")
+        rf.pack(side="right", fill="x", expand=True)
+        ttk.Label(rf, text="Scale", style="CardMuted.TLabel").pack(anchor="w")
+        self.scale_var = tk.StringVar(value="720p")
+        ttk.Combobox(rf, textvariable=self.scale_var,
+                     values=["Original", "1080p", "720p", "540p", "360p"],
+                     state="readonly", width=10).pack(anchor="w", pady=(2, 0))
+
+        self.preview_while_live = tk.BooleanVar(value=True)
+        ttk.Checkbutton(right, text="Show preview while live",
+                        variable=self.preview_while_live).pack(anchor="w", pady=(10, 0))
+
+        self.go_btn = ttk.Button(right, text="●  GO LIVE", style="Accent.TButton",
+                                 command=self.toggle_live)
+        self.go_btn.pack(fill="x", pady=(14, 6))
+
+        self.conn_label = ttk.Label(right, text="Viewers: —", style="CardMuted.TLabel")
+        self.conn_label.pack(anchor="w")
+        self.err_label = ttk.Label(right, text="", style="CardMuted.TLabel",
+                                   wraplength=250, justify="left", foreground=YELLOW)
+        self.err_label.pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(right, text="HOW IT WORKS", style="Section.TLabel").pack(
+            anchor="w", pady=(14, 4))
+        for line in ("1. Pick a window or monitor",
+                     "2. Set NDI name + quality",
+                     "3. GO LIVE — find it in NDI Studio Monitor / OBS"):
+            ttk.Label(right, text=line, style="CardMuted.TLabel").pack(anchor="w")
+
+        # Footer
+        self.footer = tk.Label(self, text="Ready.", bg=BG_ROOT, fg=MUTED,
+                               font=FONT_SMALL, anchor="w")
+        self.footer.pack(fill="x", padx=18, pady=(0, 10))
+
+    # -- sources ---------------------------------------------------------
+    def refresh_sources(self):
+        wins = []
+        try:
+            wins = list_windows()
+        except Exception:
+            wins = []
+        mons = []
+        try:
+            mons = list_monitors()
+        except Exception:
+            mons = []
+        items: list[dict] = []
+        for w in wins:
+            items.append({"kind": "window",
+                          "label": f"▣ {w['title']}  ·  {w['w']}x{w['h']}",
+                          "sub": f"{w.get('app','')}  {w['x']},{w['y']}  {w['w']}x{w['h']}",
+                          **{k: w[k] for k in ("x", "y", "w", "h")},
+                          "title": w["title"]})
+        for m in mons:
+            items.append({"kind": "monitor", "label": f"◫ {m['label']}",
+                          "sub": f"Monitor {m['index']}  {m['x']},{m['y']}  {m['w']}x{m['h']}",
+                          "x": m["x"], "y": m["y"], "w": m["w"], "h": m["h"]})
+        items.append({"kind": "test", "label": "≋ Test pattern (no capture needed)",
+                      "sub": "Animated bars — great for checking NDI end-to-end",
+                      "w": 1280, "h": 720})
+        self.sources = items
+        self._render_list()
+        n_win = sum(1 for i in items if i["kind"] == "window")
+        self.footer.configure(
+            text=f"Found {n_win} window(s), {len(mons)} monitor(s). "
+                 + ("" if HAVE_NDI else "NDI lib missing: showing preview only — `pip install cyndilib`."))
+        # keep selection if possible
+        if self.selected:
+            for i, it in enumerate(self._filtered()):
+                if it["label"] == self.selected.get("label"):
+                    self.src_list.selection_set(i)
+                    break
+
+    def _filtered(self) -> list[dict]:
+        q = self.search_var.get().strip().lower()
+        if not q:
+            return self.sources
+        return [s for s in self.sources if q in s["label"].lower()]
+
+    def _render_list(self):
+        cur = self.src_list.curselection()
+        self.src_list.delete(0, "end")
+        for s in self._filtered():
+            self.src_list.insert("end", s["label"])
+        if cur and cur[0] < self.src_list.size():
+            self.src_list.selection_set(cur[0])
+
+    def _on_select(self, _e=None):
+        sel = self.src_list.curselection()
+        if not sel:
+            return
+        items = self._filtered()
+        if sel[0] >= len(items):
+            return
+        self.selected = items[sel[0]]
+        s = self.selected
+        if s["kind"] == "test":
+            detail = "Test pattern · output follows Scale setting"
+        else:
+            detail = f"{s.get('title', s['label'])}\n{s.get('sub','')}"
+        self.src_detail.configure(text=detail)
+        if self.previewing or self.live:
+            self._restart_engine()
+
+    def _open_region_picker(self):
+        RegionPicker(self, self._on_region_pick)
+
+    def _on_region_pick(self, region: dict):
+        self.sources.append(region)
+        self._render_list()
+        idx = len(self._filtered()) - 1
+        self.src_list.selection_clear(0, "end")
+        self.src_list.selection_set(idx)
+        self._on_select()
+
+    # -- engine control --------------------------------------------------
+    def _engine_params(self):
+        fps = 30
+        try:
+            fps = int(self.fps_var.get())
+        except ValueError:
+            pass
+        return fps, self.scale_var.get(), self.ndi_name.get().strip() or "TK Broadcaster"
+
+    def _start_engine(self):
+        if not self.selected:
+            self.footer.configure(text="Pick a source first.")
+            return
+        self._stop_engine()
+        fps, scale, name = self._engine_params()
+        self.preview_q = queue.Queue(maxsize=2)
+        self.engine = CaptureEngine(self.selected, fps, scale, name,
+                                    self.sender, self.preview_q, self.status)
+        self.engine.start()
+
+    def _stop_engine(self):
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine.join(timeout=2.0)
+            self.engine = None
+        try:
+            self.sender.close()
+        except Exception:
+            pass
+
+    def _restart_engine(self):
+        if self.live or self.previewing:
+            self._start_engine()
+
+    def toggle_preview(self):
+        if self.live:
+            return
+        self.previewing = not self.previewing
+        if self.previewing:
+            if not self.selected:
+                self.footer.configure(text="Pick a source first.")
+                self.previewing = False
+                return
+            self._start_engine()
+            self.footer.configure(text="Previewing… (not broadcasting)")
+        else:
+            self._stop_engine()
+            self.footer.configure(text="Preview stopped.")
+
+    def toggle_live(self):
+        if not self.live:
+            if not self.selected:
+                self.footer.configure(text="Pick a source first.")
+                return
+            self.live = True
+            self.previewing = False
+            self._start_engine()
+            self.go_btn.configure(text="■  STOP", style="Stop.TButton")
+            self.live_pill.configure(text="●  LIVE", bg="#3a1420", fg=RED)
+            mode = "LIVE on NDI" if HAVE_NDI else "LIVE (preview-only, no NDI lib)"
+            self.footer.configure(text=f"{mode} as “{self._engine_params()[2]}”.")
+        else:
+            self.live = False
+            self._stop_engine()
+            self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
+            self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
+            self.footer.configure(text="Broadcast stopped.")
+
+    # -- ticks -----------------------------------------------------------
+    def _preview_tick(self):
+        try:
+            show = self.previewing or (self.live and self.preview_while_live.get())
+            if show and HAVE_IMAGETK:
+                try:
+                    thumb = self.preview_q.get_nowait()
+                    box_w = max(200, self.preview_label.winfo_width() - 4)
+                    box_h = max(150, self.preview_label.winfo_height() - 4)
+                    img = thumb.copy()
+                    img.thumbnail((box_w, box_h))
+                    self._photo = ImageTk.PhotoImage(img)
+                    self.preview_label.configure(image=self._photo, text="")
+                except queue.Empty:
+                    pass
+            elif not (self.previewing or self.live):
+                if str(self.preview_label.cget("text")) == "":
+                    self.preview_label.configure(
+                        image="", text="Select a source, then press  ▶ Preview  or  GO LIVE")
+        except Exception:
+            pass
+        self.after(80, self._preview_tick)
+
+    def _stats_tick(self):
+        try:
+            if self.engine is not None and self.status.get("running"):
+                fps = self.status.get("actual_fps", 0.0)
+                n = self.status.get("frames", 0)
+                w, h = self.status.get("out_w", 0), self.status.get("out_h", 0)
+                self.stat_label.configure(text=f"{w}x{h}  ·  {fps} fps  ·  {n} frames")
+                if self.live:
+                    try:
+                        c = self.sender.connections()
+                        self.conn_label.configure(text=f"Viewers: {c}")
+                    except Exception:
+                        pass
+            err = self.status.get("last_error", "")
+            if err:
+                self.err_label.configure(text=f"⚠ {err[:160]}")
+        except Exception:
+            pass
+        self.after(500, self._stats_tick)
+
+    def on_close(self):
+        try:
+            self._stop_engine()
+        finally:
+            self.destroy()
+
+
+def main():
+    app = NdiBroadcasterApp()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
