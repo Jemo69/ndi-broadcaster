@@ -12,6 +12,7 @@ vMix, Resolume, etc.
 - ◫ **Monitor capture** + ▦ **drag-to-select custom region**
 - ≋ **Test pattern** source (checks your NDI chain without screen permissions)
 - 👀 Live preview in-app, actual-FPS + resolution stats, viewer count
+- 🖱 **Show/hide mouse cursor** — checkbox decides whether viewers see your pointer (on by default, applies instantly, no restart)
 - 🎚 Frame rate (15–60) and output scale (Original / 1080p / 720p / 540p / 360p)
 - 🌙 Polished dark Tk UI
 

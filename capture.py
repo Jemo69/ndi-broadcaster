@@ -5,6 +5,9 @@ at a target FPS, feeds preview frames to the UI and BGRA frames to NDI.
 from __future__ import annotations
 
 import queue
+import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -34,6 +37,131 @@ def compute_output_size(src_w: int, src_h: int, scale: str) -> tuple[int, int]:
     w = max(2, round(src_w * target_h / src_h))
     w -= w % 2  # keep even for NDI / codecs
     return (w, target_h)
+
+
+# -- mouse cursor overlay -------------------------------------------------
+# mss grabs the screen pixels but never includes the mouse pointer, so when
+# "show cursor" is on we paint a small arrow at the live pointer position.
+_X11_STATE: dict = {"init": False, "ok": False, "lib": None,
+                    "display": None, "root": 0}
+_XDOTOOL: str | None = None
+_XDOTOOL_CHECKED = False
+
+
+def _init_x11() -> bool:
+    """One-time X11 setup via ctypes (no extra deps). False on Wayland/etc."""
+    if _X11_STATE["init"]:
+        return _X11_STATE["ok"]
+    _X11_STATE["init"] = True
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        from ctypes import c_int, c_uint, c_ulong  # noqa: F841
+        lib = ctypes.CDLL("libX11.so.6")
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XDefaultRootWindow.restype = c_ulong
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XQueryPointer.restype = c_int
+        lib.XQueryPointer.argtypes = [ctypes.c_void_p, c_ulong,
+                                      ctypes.POINTER(c_ulong), ctypes.POINTER(c_ulong),
+                                      ctypes.POINTER(c_int), ctypes.POINTER(c_int),
+                                      ctypes.POINTER(c_int), ctypes.POINTER(c_int),
+                                      ctypes.POINTER(c_uint)]
+        disp = lib.XOpenDisplay(None)
+        if not disp:
+            return False
+        root = lib.XDefaultRootWindow(disp)
+        _X11_STATE.update({"ok": True, "lib": lib,
+                           "display": disp, "root": root})
+        return True
+    except Exception:
+        _X11_STATE["ok"] = False
+        return False
+
+
+def get_cursor_pos() -> tuple[int, int] | None:
+    """Live pointer position in screen pixels, or None if unavailable."""
+    # Windows: cheap, dependency-free.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            pt = wintypes.POINT()
+            if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+                return (int(pt.x), int(pt.y))
+        except Exception:
+            return None
+        return None
+    # Linux: fast X11 path, xdotool fallback, None on pure Wayland.
+    if sys.platform.startswith("linux"):
+        if _init_x11():
+            try:
+                import ctypes
+                from ctypes import c_int, c_uint, c_ulong, byref
+                lib = _X11_STATE["lib"]
+                disp = _X11_STATE["display"]
+                root = _X11_STATE["root"]
+                rr, cr = c_ulong(), c_ulong()
+                rx, ry, wx, wy = c_int(), c_int(), c_int(), c_int()
+                mask = c_uint()
+                ok = lib.XQueryPointer(disp, root, byref(rr), byref(cr),
+                                       byref(rx), byref(ry),
+                                       byref(wx), byref(wy), byref(mask))
+                if ok:
+                    return (int(rx.value), int(ry.value))
+            except Exception:
+                pass
+        global _XDOTOOL, _XDOTOOL_CHECKED
+        if not _XDOTOOL_CHECKED:
+            _XDOTOOL_CHECKED = True
+            _XDOTOOL = shutil.which("xdotool")
+        if _XDOTOOL:
+            try:
+                out = subprocess.run(
+                    [_XDOTOOL, "getmouselocation", "--shell"],
+                    capture_output=True, text=True, timeout=0.5)
+                if out.returncode == 0:
+                    vals: dict[str, int] = {}
+                    for line in out.stdout.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            try:
+                                vals[k.strip()] = int(v.strip())
+                            except ValueError:
+                                pass
+                    if "X" in vals and "Y" in vals:
+                        return (vals["X"], vals["Y"])
+            except Exception:
+                pass
+        return None
+    # macOS / others: not implemented without extra deps.
+    return None
+
+
+def draw_cursor_overlay(img, x: float, y: float) -> None:
+    """Paint a white-arrow/black-outline cursor, tip at (x, y). In place."""
+    try:
+        from PIL import ImageDraw
+    except ImportError:
+        return
+    try:
+        out_h = img.size[1]
+    except Exception:
+        return
+    s = max(1.0, out_h / 720.0)
+    # Classic pointer shape, tip at (0, 0).
+    base = [(0, 0), (0, 17), (4.2, 12.6), (6.8, 18),
+            (9.0, 16.8), (6.4, 11.4), (11.2, 11.2)]
+    pts = [(x + px * s, y + py * s) for px, py in base]
+    d = ImageDraw.Draw(img)
+    try:
+        d.polygon(pts, fill="white", outline="black",
+                  width=max(1, int(round(s))))
+    except TypeError:
+        # Older Pillow without width= — fill then thin outline.
+        d.polygon(pts, fill="white", outline="black")
 
 
 def make_test_pattern(w: int, h: int, t: float):
@@ -74,6 +202,7 @@ class CaptureEngine(threading.Thread):
         sender: NdiSender,
         preview_queue: "queue.Queue",
         status: dict,
+        show_cursor: bool = True,
     ) -> None:
         super().__init__(daemon=True)
         self.source = dict(source)
@@ -83,6 +212,7 @@ class CaptureEngine(threading.Thread):
         self.sender = sender
         self.preview_queue = preview_queue
         self.status = status
+        self.show_cursor = bool(show_cursor)
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -199,6 +329,23 @@ class CaptureEngine(threading.Thread):
                         "RGB", shot.size, shot.bgra, "raw", "BGRX")
                     if (img.width, img.height) != (out_w, out_h):
                         img = img.resize((out_w, out_h), Image.BILINEAR)
+
+                    # Cursor overlay (mss never captures the pointer).
+                    if self.show_cursor:
+                        try:
+                            cpos = get_cursor_pos()
+                            if cpos is not None:
+                                cx, cy = cpos
+                                rx = cx - region["left"]
+                                ry = cy - region["top"]
+                                rw, rh = region["width"], region["height"]
+                                if 0 <= rx < rw and 0 <= ry < rh and rw > 0 and rh > 0:
+                                    ox = rx * out_w / rw
+                                    oy = ry * out_h / rh
+                                    if 0 <= ox < out_w and 0 <= oy < out_h:
+                                        draw_cursor_overlay(img, ox, oy)
+                        except Exception:
+                            pass
 
                 # Preview (latest-frame only)
                 try:

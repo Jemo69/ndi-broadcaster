@@ -140,6 +140,7 @@ class NdiBroadcasterApp(tk.Tk):
         self.previewing = False
         self.live = False
         self._photo = None
+        self.show_cursor = tk.BooleanVar(value=True)
 
         self._build_style()
         self._build_layout()
@@ -288,6 +289,10 @@ class NdiBroadcasterApp(tk.Tk):
         self.preview_while_live = tk.BooleanVar(value=True)
         ttk.Checkbutton(right, text="Show preview while live",
                         variable=self.preview_while_live).pack(anchor="w", pady=(10, 0))
+
+        ttk.Checkbutton(right, text="Show mouse cursor in broadcast",
+                        variable=self.show_cursor,
+                        command=self._on_cursor_toggle).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(right, text="Discovery Server (cross-subnet, optional)",
                   style="CardMuted.TLabel").pack(anchor="w", pady=(10, 2))
@@ -441,8 +446,17 @@ class NdiBroadcasterApp(tk.Tk):
         fps, scale, name = self._engine_params()
         self.preview_q = queue.Queue(maxsize=2)
         self.engine = CaptureEngine(self.selected, fps, scale, name,
-                                    self.sender, self.preview_q, self.status)
+                                    self.sender, self.preview_q, self.status,
+                                    show_cursor=self.show_cursor.get())
         self.engine.start()
+
+    def _on_cursor_toggle(self):
+        """Apply cursor choice instantly — no restart needed."""
+        if self.engine is not None:
+            try:
+                self.engine.show_cursor = bool(self.show_cursor.get())
+            except Exception:
+                pass
 
     def _stop_engine(self):
         if self.engine is not None:
