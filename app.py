@@ -139,6 +139,7 @@ class NdiBroadcasterApp(tk.Tk):
                              "out_w": 0, "out_h": 0, "last_error": ""}
         self.previewing = False
         self.live = False
+        self._gen = 0  # engine generation: bumped on every stop/start
         self._photo = None
         self.show_cursor = tk.BooleanVar(value=True)
 
@@ -437,18 +438,31 @@ class NdiBroadcasterApp(tk.Tk):
         except Exception as e:
             self.footer.configure(text=f"Discovery Server not saved: {e}")
 
-    def _start_engine(self):
+    def _is_current_gen(self, gen: int) -> bool:
+        """Generation check handed to the capture thread (see CaptureEngine)."""
+        return gen == self._gen
+
+    def _start_engine(self) -> bool:
+        """(Re)start capture + sender for the current selection.
+
+        Returns True when a capture thread was launched. Never leaves a
+        stale thread behind: the previous engine is fully stopped first.
+        """
         if not self.selected:
             self.footer.configure(text="Pick a source first.")
-            return
+            return False
         self._stop_engine()
+        self._gen += 1
         self._apply_discovery_config()
         fps, scale, name = self._engine_params()
         self.preview_q = queue.Queue(maxsize=2)
         self.engine = CaptureEngine(self.selected, fps, scale, name,
                                     self.sender, self.preview_q, self.status,
-                                    show_cursor=self.show_cursor.get())
+                                    show_cursor=self.show_cursor.get(),
+                                    generation=self._gen,
+                                    is_current=self._is_current_gen)
         self.engine.start()
+        return True
 
     def _on_cursor_toggle(self):
         """Apply cursor choice instantly — no restart needed."""
@@ -458,11 +472,30 @@ class NdiBroadcasterApp(tk.Tk):
             except Exception:
                 pass
 
-    def _stop_engine(self):
-        if self.engine is not None:
-            self.engine.stop()
-            self.engine.join(timeout=2.0)
-            self.engine = None
+    def _stop_engine(self) -> None:
+        """Stop capture and close the sender. Never raises.
+
+        The generation bump invalidates any stale capture thread first, so
+        even if it takes a moment to exit it can no longer touch the shared
+        status — a new engine can then start cleanly (STOP → GO LIVE).
+        """
+        eng, self.engine = self.engine, None
+        self._gen += 1
+        if eng is not None:
+            try:
+                eng.stop()
+            except Exception:
+                pass
+            try:
+                eng.join(timeout=5.0)
+            except Exception:
+                pass
+            try:
+                if eng.is_alive():
+                    self.footer.configure(
+                        text="Capture thread slow to stop — wait a moment, then GO LIVE.")
+            except Exception:
+                pass
         try:
             self.sender.close()
         except Exception:
@@ -481,7 +514,16 @@ class NdiBroadcasterApp(tk.Tk):
                 self.footer.configure(text="Pick a source first.")
                 self.previewing = False
                 return
-            self._start_engine()
+            try:
+                started = self._start_engine()
+            except Exception as e:
+                started = False
+                self.footer.configure(text=f"Couldn't preview: {e}")
+            if not started:
+                self.previewing = False
+                self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
+                self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
+                return
             self.footer.configure(text="Previewing… (not broadcasting)")
         else:
             self._stop_engine()
@@ -508,20 +550,43 @@ class NdiBroadcasterApp(tk.Tk):
             if not self.selected:
                 self.footer.configure(text="Pick a source first.")
                 return
+            try:
+                started = self._start_engine()
+                fail_msg = ""
+            except Exception as e:
+                started = False
+                fail_msg = f"Couldn't go live: {e}"
+            if started and (self.engine is None):
+                started = False
+            if not started:
+                # Stay (or return to) idle so ● GO LIVE is always available to retry.
+                self.live = False
+                self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
+                self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
+                if not fail_msg:
+                    fail_msg = (self.status.get("last_error")
+                                or "Couldn't go live — press ● GO LIVE to retry.")
+                    if not fail_msg.startswith("Couldn't"):
+                        fail_msg = f"Couldn't go live: {fail_msg}"
+                self.footer.configure(text=fail_msg)
+                return
             self.live = True
             self.previewing = False
-            self._start_engine()
             self.go_btn.configure(text="■  STOP", style="Stop.TButton")
             self.live_pill.configure(text="●  LIVE", bg="#3a1420", fg=RED)
             mode = "LIVE on NDI" if HAVE_NDI else "LIVE (preview-only, no NDI lib)"
             self.footer.configure(text=f"{mode} as “{self._engine_params()[2]}”.")
         else:
+            # STOP always lands back on a working ● GO LIVE button, even if
+            # teardown itself hits an error.
             self.live = False
-            self._stop_engine()
-            self._reset_idle_ui()
-            self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
-            self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
-            self.footer.configure(text="Stopped — pick a source and GO LIVE when ready.")
+            try:
+                self._stop_engine()
+            finally:
+                self._reset_idle_ui()
+                self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
+                self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
+                self.footer.configure(text="Stopped — pick a source and GO LIVE when ready.")
 
     # -- ticks -----------------------------------------------------------
     def _preview_tick(self):
@@ -548,6 +613,22 @@ class NdiBroadcasterApp(tk.Tk):
 
     def _stats_tick(self):
         try:
+            if self.live and not self.status.get("running"):
+                # Engine died (failed start or mid-broadcast fault) — drop back
+                # to idle so ● GO LIVE is always available to retry.
+                try:
+                    alive = self.engine is not None and self.engine.is_alive()
+                except Exception:
+                    alive = False
+                if not alive:
+                    err = (self.status.get("last_error") or "capture stopped").strip()
+                    self.live = False
+                    self._reset_idle_ui()
+                    self.go_btn.configure(text="●  GO LIVE", style="Accent.TButton")
+                    self.live_pill.configure(text="●  IDLE", bg="#1d2532", fg=MUTED)
+                    self.footer.configure(
+                        text=f"Broadcast stopped ({err}) — press ● GO LIVE to retry.")
+                    return
             if self.engine is not None and self.status.get("running"):
                 fps = self.status.get("actual_fps", 0.0)
                 n = self.status.get("frames", 0)

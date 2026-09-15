@@ -203,6 +203,8 @@ class CaptureEngine(threading.Thread):
         preview_queue: "queue.Queue",
         status: dict,
         show_cursor: bool = True,
+        generation: int = 0,
+        is_current=None,
     ) -> None:
         super().__init__(daemon=True)
         self.source = dict(source)
@@ -213,7 +215,19 @@ class CaptureEngine(threading.Thread):
         self.preview_queue = preview_queue
         self.status = status
         self.show_cursor = bool(show_cursor)
+        # Generation guard: the app bumps its generation on every stop/start,
+        # so a stale thread that outlives its session never clobbers the new
+        # session's shared status (e.g. clearing running right after a restart).
+        self.generation = generation
+        self.is_current = is_current  # Callable[[int], bool] | None
         self._stop = threading.Event()
+
+    def _current(self) -> bool:
+        """True when this thread still owns the shared status dict."""
+        try:
+            return True if self.is_current is None else bool(self.is_current(self.generation))
+        except Exception:
+            return True
 
     def stop(self) -> None:
         self._stop.set()
@@ -266,9 +280,15 @@ class CaptureEngine(threading.Thread):
             )
 
         try:
+            if not self._current():
+                # Superseded before the thread got going (e.g. instant STOP
+                # after GO LIVE) — don't touch the shared sender/status.
+                return
             self.sender.open(self.ndi_name, out_w, out_h, self.fps)
         except Exception as e:
             self.status["last_error"] = f"NDI open failed: {e}"
+            if self._current():
+                self.status["running"] = False
             return
 
         self.status.update({
@@ -295,7 +315,7 @@ class CaptureEngine(threading.Thread):
         next_t = t0
 
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and self._current():
                 now = time.monotonic()
                 if now < next_t:
                     time.sleep(min(0.005, next_t - now))
@@ -387,13 +407,15 @@ class CaptureEngine(threading.Thread):
                 if elapsed > 0 and frame_count % 5 == 0:
                     inst = frame_count / elapsed
                     ema_fps = 0.85 * ema_fps + 0.15 * inst
-                    self.status["actual_fps"] = round(ema_fps, 1)
-                    self.status["frames"] = frame_count
+                    if self._current():
+                        self.status["actual_fps"] = round(ema_fps, 1)
+                        self.status["frames"] = frame_count
         finally:
             if sct is not None:
                 try:
                     sct.close()
                 except Exception:
                     pass
-            self.status["running"] = False
-            self.status["frames"] = frame_count
+            if self._current():
+                self.status["running"] = False
+                self.status["frames"] = frame_count
